@@ -1,0 +1,292 @@
+"""
+graph.py — LangGraph orchestration.
+
+StateGraph with five nodes and conditional routing.
+Wiring together RAG, RL, Tools, and Telemetry.
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+import sys
+from typing import Any
+
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.errors import NodeInterrupt
+
+from state import AgentState, IncidentState, RemediationProposal, Severity
+from rag import KnowledgeBase
+from learning import LearningEngine, encode_state, ACTION_SPACE
+from tools import TOOL_DISPATCHER, ROLLBACK_DISPATCHER
+
+logger = logging.getLogger("sre_graph")
+logger.setLevel(logging.INFO)
+
+
+# ──────────────────────────────────────────────
+# Global Instances
+# ──────────────────────────────────────────────
+
+kb = KnowledgeBase()
+engine = LearningEngine()
+
+
+# ──────────────────────────────────────────────
+# 1. Analyzer Node
+# ──────────────────────────────────────────────
+
+def analyzer_node(state: AgentState) -> dict[str, Any]:
+    """Scan telemetry_events for anomalies and build IncidentState."""
+    logger.info("analyzer_node | Scanning telemetry batch...")
+    events = state.get("telemetry_events", [])
+    
+    anomalous_metric = None
+    for evt in events:
+        if evt.get("event_type") == "metric":
+            cpu = evt.get("cpu_pct", 0)
+            lat = evt.get("latency_ms", 0)
+            if cpu > 85 or lat > 1500:
+                anomalous_metric = evt
+                break
+                
+    if anomalous_metric:
+        service = anomalous_metric.get("service", "unknown")
+        cpu = anomalous_metric.get("cpu_pct", 0)
+        lat = anomalous_metric.get("latency_ms", 0)
+        
+        severity = Severity.CRITICAL if cpu > 95 else Severity.HIGH
+        summary = f"Detected high CPU ({cpu:.1f}%) or Latency ({lat:.0f}ms) on {service}"
+        
+        # Calculate derived metrics for snapshot
+        err_rates = [e.get("error") for e in events if e.get("event_type") == "trace"]
+        error_rate = sum(err_rates) / len(err_rates) * 100 if err_rates else 0.0
+        
+        snapshot = {
+            "cpu_pct": cpu,
+            "mem_pct": anomalous_metric.get("mem_pct", 50.0),
+            "latency_ms": lat,
+            "error_rate": error_rate,
+            "deploy_age_hours": 1.5,  # Stubbed proxy
+            "active_alerts": 3.0      # Stubbed proxy
+        }
+        
+    else:
+        # No anomalies
+        severity = Severity.LOW
+        summary = "No significant anomalies detected in the current telemetry window."
+        service = "system"
+        snapshot = {"cpu_pct": 20.0, "mem_pct": 40.0, "latency_ms": 50.0}
+
+    incident = IncidentState(
+        anomaly_summary=summary,
+        severity=severity,
+        affected_service=service,
+        metrics_snapshot=snapshot,
+        rag_context=[]
+    )
+    
+    logger.info(f"analyzer_node | Constructed IncidentState: severity={severity.value} on {service}")
+    return {"incident": incident}
+
+
+# ──────────────────────────────────────────────
+# 2. Researcher Node
+# ──────────────────────────────────────────────
+
+def researcher_node(state: AgentState) -> dict[str, Any]:
+    """Retrieve expert knowledge via FAISS based on the anomaly summary."""
+    incident = state["incident"]
+    assert incident is not None
+    
+    logger.info(f"researcher_node | Fetching guides for: '{incident.anomaly_summary}'")
+    guides = kb.query(incident.anomaly_summary, k=3)
+    
+    # Update incident with RAG context
+    incident.rag_context = guides
+    logger.info(f"researcher_node | Retrieved {len(guides)} guides.")
+    
+    return {"incident": incident}
+
+
+# ──────────────────────────────────────────────
+# 3. Predictor Node
+# ──────────────────────────────────────────────
+
+def predictor_node(state: AgentState) -> dict[str, Any]:
+    """RL Engine encodes state and selects an action."""
+    incident = state["incident"]
+    assert incident is not None
+    
+    state_vec = encode_state(incident)
+    logger.info(f"predictor_node | Encoded state vector: {state_vec}")
+    
+    action = engine.select_action(state_vec, epsilon=0.1)
+    logger.info(f"predictor_node | RL selected action: {action}")
+    
+    return {"rl_prediction": action}
+
+
+# ──────────────────────────────────────────────
+# 4. Proposer Node
+# ──────────────────────────────────────────────
+
+def proposer_node(state: AgentState) -> dict[str, Any]:
+    """Assemble final RemediationProposal with confidence and rollback mappings."""
+    incident = state["incident"]
+    action = state["rl_prediction"]
+    assert incident is not None and action is not None
+    
+    svc = incident.affected_service
+    
+    # ── Map Action -> Params ──
+    if action == "scale_replicas":
+        params = {"service": svc, "replicas": 3}
+        rollback_params = {"service": svc, "previous_count": 1}
+    elif action == "restart_pod":
+        params = {"service": svc, "pod_id": f"{svc}-pod-{uuid.uuid4().hex[:4]}"}
+        rollback_params = {"service": svc, "pod_id": params["pod_id"]}
+    elif action == "rollback_deployment":
+        params = {"service": svc, "revision": 2}
+        rollback_params = {"service": svc, "revision": 2}
+    elif action == "increase_memory_limit":
+        params = {"service": svc, "limit_mb": 1024}
+        rollback_params = {"service": svc, "limit_mb": 512}
+    elif action == "flush_cache":
+        params = {"service": svc}
+        rollback_params = {"service": svc}
+    elif action == "reroute_traffic":
+        params = {"service": svc, "target": "us-east-2", "weight_pct": 50}
+        rollback_params = {"service": svc, "target": "us-east-1", "weight_pct": 100}
+    else:  # no_action
+        params = {"service": svc}
+        rollback_params = {"service": svc}
+
+    rollback_action = ROLLBACK_DISPATCHER.get(action, "rollback_no_action")
+    
+    # ── Confidence & Rationale ──
+    state_vec = encode_state(incident)
+    confidence = engine.get_confidence(state_vec, action)
+    
+    rag_text = incident.rag_context[0][:120] + "..." if incident.rag_context else "No matching guides."
+    
+    # UPGRADE: replace hardcoded risk_rationale with LangChain ChatPromptTemplate passing
+    # RAG context + RL recommendation to GPT-4 for natural-language rationale generation
+    rationale = (
+        f"Anomaly: {incident.anomaly_summary}. "
+        f"Severity: {incident.severity.value}. "
+        f"RL selected '{action}' (confidence {confidence:.2f}). "
+        f"RAG matched: '{rag_text}'. "
+        f"Rollback: {rollback_action}({rollback_params})."
+    )
+    
+    proposal = RemediationProposal(
+        action=action,
+        action_params=params,
+        confidence_score=confidence,
+        risk_rationale=rationale,
+        rollback_action=rollback_action,
+        rollback_params=rollback_params
+    )
+    
+    logger.info(f"proposer_node | Generated proposal. Confidence: {confidence:.2f}")
+    return {"proposal": proposal}
+
+
+# ──────────────────────────────────────────────
+# 5. Human in the Loop Node
+# ──────────────────────────────────────────────
+
+def human_in_the_loop_node(state: AgentState) -> dict[str, Any]:
+    """
+    Execute action if confidence is high and human approves; update RL policy.
+    This node now relies on the LangGraph Checkpointer to pause execution.
+    """
+    proposal = state["proposal"]
+    incident = state["incident"]
+    assert proposal is not None and incident is not None
+    
+    # ── Check if we are resuming from an interrupt ──
+    # The API will resume the thread by injecting `{ "human_approved": True/False }` into the state.
+    # On the FIRST pass, state["human_approved"] is None (or False if default), so we pause.
+    
+    # If this is the initial arrival at the node and confidence >= 0.75, we interrupt.
+    if proposal.confidence_score >= 0.75 and state.get("human_approved") is None:
+        logger.info(f"human_in_the_loop_node | High confidence ({proposal.confidence_score:.2f}). Pausing for human approval via NodeInterrupt.")
+        # Pausing the graph to wait for API approval
+        raise NodeInterrupt("Requires human approval")
+        
+    logger.info("human_in_the_loop_node | Resuming execution and evaluating outcome.")
+    reward = 0.0
+    
+    # Setup for RL experience logging
+    s_vec = encode_state(incident)
+    action_name = proposal.action
+    
+    if proposal.confidence_score >= 0.75:
+        # We are resuming from an interrupt. Check the injected state.
+        human_approved = state.get("human_approved", False)
+        
+        if human_approved:
+            logger.info("human_in_the_loop_node | Human approved via API. Dispatching tool...")
+            tool_func = TOOL_DISPATCHER.get(action_name)
+            if tool_func:
+                tool_func(**proposal.action_params)
+            reward = engine.calculate_reward("resolved", 1.0)
+        else:
+            logger.info("human_in_the_loop_node | Human REJECTED proposal via API.")
+            reward = engine.calculate_reward("escalated", 0.0)
+    else:
+        # Low confidence -> Auto escalate immediately (no interrupt)
+        logger.warning(f"human_in_the_loop_node | Low confidence ({proposal.confidence_score:.2f}). Auto-escalating.")
+        human_approved = False
+        reward = engine.calculate_reward("escalated", 0.5)
+
+    # ── Continuous Learning Update ──
+    s_next = s_vec * 0.0
+    engine.store_experience(s_vec, action_name, reward, s_next)
+    engine.update_policy()
+    
+    return {"human_approved": human_approved, "reward_signal": reward}
+
+
+# ──────────────────────────────────────────────
+# Routing & Graph Assembly
+# ──────────────────────────────────────────────
+
+def _route_after_analyzer(state: AgentState) -> str:
+    incident = state["incident"]
+    if incident and incident.severity == Severity.LOW:
+        logger.info("_route_after_analyzer | Severity LOW -> skipping RAG directly to predictor")
+        return "predictor"
+    logger.info("_route_after_analyzer | Severity HIGH/CRITICAL -> routing to RAG researcher")
+    return "researcher"
+
+
+# Build state graph
+graph = StateGraph(AgentState)
+
+graph.add_node("analyzer", analyzer_node)
+graph.add_node("researcher", researcher_node)
+graph.add_node("predictor", predictor_node)
+graph.add_node("proposer", proposer_node)
+graph.add_node("human_in_the_loop", human_in_the_loop_node)
+
+graph.set_entry_point("analyzer")
+
+graph.add_conditional_edges(
+    "analyzer", 
+    _route_after_analyzer,
+    {"researcher": "researcher", "predictor": "predictor"}
+)
+graph.add_edge("researcher", "predictor")
+graph.add_edge("predictor", "proposer")
+graph.add_edge("proposer", "human_in_the_loop")
+graph.add_edge("human_in_the_loop", END)
+
+# Instantiate a global memory checkpointer for state persistence
+memory = MemorySaver()
+
+# Export compiled graph with checkpointer attached
+compiled_graph = graph.compile(checkpointer=memory)

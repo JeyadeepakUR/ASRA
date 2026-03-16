@@ -20,6 +20,7 @@ from state import AgentState, IncidentState, RemediationProposal, Severity
 from rag import KnowledgeBase
 from learning import LearningEngine, encode_state, ACTION_SPACE
 from tools import TOOL_DISPATCHER, ROLLBACK_DISPATCHER
+from config import settings
 
 logger = logging.getLogger("sre_graph")
 logger.setLevel(logging.INFO)
@@ -46,8 +47,13 @@ def analyzer_node(state: AgentState) -> dict[str, Any]:
     for evt in events:
         if evt.get("event_type") == "metric":
             cpu = evt.get("cpu_pct", 0)
+            mem = evt.get("mem_pct", 0)
             lat = evt.get("latency_ms", 0)
-            if cpu > 85 or lat > 1500:
+            if (
+                cpu > settings.anomaly_cpu_threshold
+                or mem > settings.anomaly_memory_threshold
+                or lat > 1500
+            ):
                 anomalous_metric = evt
                 break
                 
@@ -56,7 +62,7 @@ def analyzer_node(state: AgentState) -> dict[str, Any]:
         cpu = anomalous_metric.get("cpu_pct", 0)
         lat = anomalous_metric.get("latency_ms", 0)
         
-        severity = Severity.CRITICAL if cpu > 95 else Severity.HIGH
+        severity = Severity.CRITICAL if cpu > (settings.anomaly_cpu_threshold + 10) else Severity.HIGH
         summary = f"Detected high CPU ({cpu:.1f}%) or Latency ({lat:.0f}ms) on {service}"
         
         # Calculate derived metrics for snapshot
@@ -122,7 +128,7 @@ def predictor_node(state: AgentState) -> dict[str, Any]:
     state_vec = encode_state(incident)
     logger.info(f"predictor_node | Encoded state vector: {state_vec}")
     
-    action = engine.select_action(state_vec, epsilon=0.1)
+    action = engine.select_action(state_vec, epsilon=settings.rl_epsilon)
     logger.info(f"predictor_node | RL selected action: {action}")
     
     return {"rl_prediction": action}
@@ -212,7 +218,10 @@ def human_in_the_loop_node(state: AgentState) -> dict[str, Any]:
     # On the FIRST pass, state["human_approved"] is None (or False if default), so we pause.
     
     # If this is the initial arrival at the node and confidence >= 0.75, we interrupt.
-    if proposal.confidence_score >= 0.75 and state.get("human_approved") is None:
+    if (
+        proposal.confidence_score >= settings.approval_confidence_threshold
+        and state.get("human_approved") is None
+    ):
         logger.info(f"human_in_the_loop_node | High confidence ({proposal.confidence_score:.2f}). Pausing for human approval via NodeInterrupt.")
         # Pausing the graph to wait for API approval
         raise NodeInterrupt("Requires human approval")
@@ -224,7 +233,7 @@ def human_in_the_loop_node(state: AgentState) -> dict[str, Any]:
     s_vec = encode_state(incident)
     action_name = proposal.action
     
-    if proposal.confidence_score >= 0.75:
+    if proposal.confidence_score >= settings.approval_confidence_threshold:
         # We are resuming from an interrupt. Check the injected state.
         human_approved = state.get("human_approved", False)
         

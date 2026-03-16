@@ -2,11 +2,10 @@
 rag.py — Knowledge retrieval engine.
 
 Contextualises incidents using a vector knowledge base.
-Embeds expert runbook strings using FakeEmbeddings (stub) and
-indexes them in an in-memory FAISS index (cosine similarity).
+Embeds expert runbook strings using OllamaEmbeddings (local, production-grade)
+and indexes them in an in-memory FAISS index (cosine similarity).
 
-UPGRADE: swap FakeEmbeddings -> OpenAIEmbeddings(api_key=...)
-UPGRADE: replace FAISS -> ChromaDB or Pinecone for persistence
+Falls back to FakeEmbeddings if Ollama is not available (e.g., in CI/testing).
 """
 
 from __future__ import annotations
@@ -15,6 +14,8 @@ import logging
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import FakeEmbeddings
 from langchain_core.documents import Document
+
+from config import settings
 
 logger = logging.getLogger("sre_rag")
 logger.setLevel(logging.INFO)
@@ -33,18 +34,41 @@ SEED_RUNBOOKS = [
 
 
 class KnowledgeBase:
-    """FAISS-backed vector store for expert SRE Runbooks."""
+    """FAISS-backed vector store for expert SRE Runbooks with OllamaEmbeddings."""
 
-    def __init__(self, embedding_dim: int = 384) -> None:
-        logger.info("KnowledgeBase | Initialising FakeEmbeddings and FAISS index")
-        self._embeddings = FakeEmbeddings(size=embedding_dim)
+    def __init__(self) -> None:
+        embeddings = self._init_embeddings()
         
         docs = [
             Document(page_content=text, metadata={"guide_idx": i})
             for i, text in enumerate(SEED_RUNBOOKS)
         ]
-        self._store = FAISS.from_documents(docs, self._embeddings)
-        logger.info(f"KnowledgeBase | Seeded {len(docs)} expert runbooks into index.")
+        self._store = FAISS.from_documents(docs, embeddings)
+        logger.info(f"KnowledgeBase | Seeded {len(docs)} expert runbooks into FAISS index.")
+
+    def _init_embeddings(self):
+        """Initialize embeddings: try Ollama first, fall back to FakeEmbeddings."""
+        if settings.rag_provider == "ollama":
+            try:
+                from langchain_ollama import OllamaEmbeddings
+                logger.info(f"KnowledgeBase | Initialising OllamaEmbeddings: {settings.ollama_base_url} model={settings.ollama_model}")
+                embeddings = OllamaEmbeddings(
+                    base_url=settings.ollama_base_url,
+                    model=settings.ollama_model,
+                )
+                # Test connectivity by embedding a dummy string
+                embeddings.embed_query("test")
+                logger.info("KnowledgeBase | ✅ Ollama embeddings ready.")
+                return embeddings
+            except ImportError:
+                logger.warning("KnowledgeBase | langchain_ollama not installed. Falling back to FakeEmbeddings.")
+            except Exception as e:
+                logger.warning(f"KnowledgeBase | Ollama not reachable ({e}). Falling back to FakeEmbeddings. "
+                              f"Start Ollama: 'ollama serve' and pull '{settings.ollama_model}'.")
+        
+        # Fallback to FakeEmbeddings for testing/CI
+        logger.info(f"KnowledgeBase | Initialising FakeEmbeddings (dim={settings.embedding_dim}) as fallback.")
+        return FakeEmbeddings(size=settings.embedding_dim)
 
     def query(self, anomaly_summary: str, k: int = 3) -> list[str]:
         """

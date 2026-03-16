@@ -1,6 +1,14 @@
 # Autonomous SRE Agent
 
-An agentic A fully autonomous, LangGraph-orchestrated Site Reliability Engineering agent. It ingests telemetry (via webhooks), searches expert runbooks (RAG), predicts remediation actions via Reinforcement Learning (RL), and proposes fixes. It natively exposes a FastAPI backend allowing SRE teams to review and trigger actions asynchronously via a dashboard.
+Open-source MVP of a LangGraph-orchestrated Site Reliability Engineering agent. It ingests telemetry (via webhooks), searches expert runbooks (RAG), predicts remediation actions via Reinforcement Learning (RL), and proposes fixes. It exposes a FastAPI backend where SRE teams can review and approve actions asynchronously.
+
+## MVP Scope
+
+This repository is intentionally MVP-oriented for open-source collaboration.
+
+- Includes: end-to-end incident workflow, approval gate, configurable thresholds, optional API key protection, health/readiness endpoints, and containerized runtime.
+- Excludes (for now): enterprise IAM integration, durable distributed checkpointing, real cloud/Kubernetes actuators, and full policy engine.
+- Safety posture: all infra tools are simulated stubs by default and should be replaced before real production actuation.
 
 ## Architecture
 
@@ -69,22 +77,114 @@ You can run the Agent either natively via Python or via Docker.
 docker-compose up --build
 ```
 
+### Option 1b: Docker (Production-like Compose)
+```bash
+cp .env.example .env
+# set API_KEY and OPENAI_API_KEY in .env
+docker-compose -f docker-compose.prod.yml up --build
+```
+
 ### Option 2: Native Python
 1. Clone the repository and install dependencies:
 ```bash
 pip install -r requirements.txt
-# Or use pip install -e .
+# For contributor workflow (tests + formatting tools):
+pip install -e .[dev]
 ```
 2. Start the API Server:
 ```bash
 uvicorn api:app --reload --port 8000
 ```
 
-## Using the API
+### Run Tests
+```bash
+pytest -q
+```
+
+## Simulate Production Locally
+
+Use the included simulator to generate sustained webhook traffic and auto-process approvals.
+
+```bash
+# 1) Start API first
+uvicorn api:app --reload --port 8000
+
+# 2) In another terminal, run a normal traffic simulation
+python simulate_prod.py --duration 60 --rps 2
+
+# 3) Run an incident storm (more severe traffic)
+python simulate_prod.py --duration 60 --rps 5 --spike-mode
+```
+
+If API key auth is enabled, include `--api-key <your-key>` in simulator commands.
+
+For teammate-scoped PR tasks, see `TEAM_PR_MODULES.md`.
+
+## Ollama Setup (for Production-Grade Embeddings)
+
+The system uses **Ollama** for local, self-hosted text embeddings. This is free, requires no API keys, and keeps your data local.
+
+### Install Ollama
+
+1. Download and install [Ollama](https://ollama.ai/) for your OS.
+
+2. Start the Ollama server in a terminal:
+```bash
+ollama serve
+```
+
+3. In another terminal, pull the embedding model (one-time setup):
+```bash
+ollama pull nomic-embed-text
+```
+
+The embedding model will be downloaded (~274MB) and cached locally.
+
+### Alternative: Run Ollama in Docker
+
+Add to your `docker-compose.yml` (already included in dev setup if you want to use it):
+```yaml
+ollama:
+  image: ollama/ollama:latest
+  ports:
+    - "11434:11434"
+  volumes:
+    - ollama:/root/.ollama
+volumes:
+  ollama:
+```
+
+Then start both services:
+```bash
+docker-compose up sre-agent ollama
+```
+
+### Configuration
+
+The RAG system will automatically:
+- ✅ Detect if Ollama is running and use it for embeddings
+- ✅ Fall back to random embeddings (FakeEmbeddings) if Ollama is unavailable (for testing/CI)
+
+To use a different Ollama model, set in `.env`:
+```bash
+OLLAMA_MODEL=llama2
+OLLAMA_BASE_URL=http://localhost:11434
+```
+
+Available models: `nomic-embed-text` (faster, recommended), `all-minilm`, `mxbai-embed-large`, etc.
+
 
 1. **Trigger an Incident:** Submitting a webhook (e.g., from Datadog) starts a background LangGraph thread.
 ```bash
 curl -X POST http://localhost:8000/webhook/alert -H "Content-Type: application/json" -d '{"service":"api-gateway", "alert_name":"HighLatency", "severity":"critical", "metrics":{"latency_ms": 3500}}'
+```
+
+If `API_KEY_ENABLED=true`, include the header `x-api-key`:
+```bash
+curl -X POST http://localhost:8000/webhook/alert \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: <your-api-key>" \
+        -d '{"service":"api-gateway", "alert_name":"HighLatency", "severity":"critical", "metrics":{"latency_ms": 3500}}'
 ```
 
 2. **Check Pending Approvals:** The graph will pause and wait for human permission.
@@ -97,11 +197,27 @@ curl http://localhost:8000/api/incidents/pending
 curl -X POST http://localhost:8000/api/incidents/<THREAD_ID>/approve
 ```
 
+## API Health Endpoints
+
+- `GET /healthz`: liveness probe
+- `GET /readyz`: readiness probe with MVP checks
+
+## Environment Configuration
+
+Use `.env.example` as a template. Key fields:
+
+- `ENVIRONMENT`: `dev` or `prod`
+- `LOG_LEVEL`: `INFO`, `DEBUG`, etc.
+- `API_KEY_ENABLED`: `true` to protect write endpoints
+- `API_KEY`: shared secret used when API key auth is enabled
+- `ANOMALY_*`, `RL_*`, and `APPROVAL_CONFIDENCE_THRESHOLD`: model and decision tuning knobs
+
 ## Tech Stack
 
 - **Python 3.10+** with `asyncio`
 - **LangGraph** / **LangChain** for agentic orchestration
 - **FAISS** for local vector search (RAG)
+- **Ollama** for local, self-hosted text embeddings (production-grade)
 - **Pydantic v2** for data validation
 - **NumPy** for RL state encoding
 

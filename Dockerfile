@@ -22,8 +22,17 @@ RUN pip install --no-cache-dir --upgrade pip \
 # Copy the current directory contents into the container at /app
 COPY . /app
 
+# Run as a non-root user for safer defaults in shared environments
+RUN adduser --disabled-password --gecos "" appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 # Expose port for FastAPI
 EXPOSE 8000
+
+# Healthcheck aligned with FastAPI liveness endpoint
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1
 
 # Run the API server using Uvicorn
 CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

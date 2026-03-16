@@ -17,6 +17,7 @@ import numpy as np
 from typing import Any
 
 from state import IncidentState, Severity
+from config import settings
 
 logger = logging.getLogger("sre_learning")
 logger.setLevel(logging.INFO)
@@ -77,7 +78,7 @@ class LearningEngine:
         self.state_dim = state_dim
         self.n_actions = n_actions or len(ACTION_SPACE)
         self._policy_weights = np.random.randn(self.n_actions, self.state_dim) * 0.01
-        self._replay_buffer = collections.deque(maxlen=1000)
+        self._replay_buffer = collections.deque(maxlen=settings.rl_replay_buffer_size)
 
     def select_action(self, state_vec: np.ndarray, epsilon: float = 0.1) -> str:
         """ε-greedy action selection."""
@@ -109,8 +110,16 @@ class LearningEngine:
         self._replay_buffer.append((s, action_idx, r, s_next))
         logger.info(f"store_experience | stored (r={r:.2f}). Buffer size: {len(self._replay_buffer)}")
 
-    def update_policy(self, batch_size: int = 32, gamma: float = 0.9, lr: float = 0.01) -> None:
+    def update_policy(
+        self,
+        batch_size: int = 32,
+        gamma: float | None = None,
+        lr: float | None = None,
+    ) -> None:
         """Sample mini-batch from replay buffer and apply Temporal Difference update."""
+        gamma_val = gamma if gamma is not None else settings.rl_discount_factor
+        lr_val = lr if lr is not None else settings.rl_learning_rate
+
         if len(self._replay_buffer) < 2:
             logger.warning("update_policy skipped | insufficient buffer size")
             return
@@ -128,12 +137,12 @@ class LearningEngine:
             max_q_next = np.max(q_s_next)
             
             # TD Error
-            target = r + gamma * max_q_next
+            target = r + gamma_val * max_q_next
             td_error = target - q_sa
             total_td_err += td_error
 
             # Gradient step
-            self._policy_weights[a_idx] += lr * td_error * s
+            self._policy_weights[a_idx] += lr_val * td_error * s
 
         avg_td = total_td_err / batch_sz
         logger.info(f"update_policy | updated weights on batch_size={batch_sz} | avg_td_error={avg_td:.4f}")
